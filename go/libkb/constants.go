@@ -555,3 +555,6 @@ type PvlUnparsed struct {
 }
 
 const SharedTeamKeyBoxVersion1 = 1
+
+const TeamDHDerivationString = "Keybase-Derived-Team-NaCl-DH-1"
+const TeamEdDSADerivationString = "Keybase-Derived-Team-NaCl-EdDSA-1"

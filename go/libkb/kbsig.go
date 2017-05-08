@@ -585,7 +585,24 @@ func (u *User) UpdateEmailProof(key GenericKey, newEmail string) (*jsonw.Wrapper
 	return ret, nil
 }
 
-func (u *User) TeamRootSig(key GenericKey, teamSection *jsonw.Wrapper) (*jsonw.Wrapper, error) {
+type TeamSection struct {
+	Name    string `json:"name"`
+	ID      string `json:"id"`
+	Members struct {
+		Owner  []string `json:"owner"`
+		Admin  []string `json:"admin"`
+		Writer []string `json:"writer"`
+		Reader []string `json:"reader"`
+	} `json:"members"`
+	PerTeamKey struct {
+		Generation    int    `json:"generation"`
+		EncryptionKID string `json:"encryption_kid"`
+		SigningKID    string `json:"signing_kid"`
+		// `reverse_sig` is not included here. It's added manually with jsonw.
+	} `json:"per_team_key"`
+}
+
+func (u *User) TeamRootSig(key GenericKey, teamSection TeamSection, reverseSig string) (*jsonw.Wrapper, error) {
 	ret, err := ProofMetadata{
 		Me:         u,
 		LinkType:   LinkTypeTeamRoot,
@@ -596,8 +613,22 @@ func (u *User) TeamRootSig(key GenericKey, teamSection *jsonw.Wrapper) (*jsonw.W
 	if err != nil {
 		return nil, err
 	}
+
+	teamSectionJSON, err := jsonw.WrapperFromObject(teamSection)
+	if err != nil {
+		return nil, err
+	}
+
+	// Manually insert the reverse sig, so that we can make sure it's `null`
+	// when omitted, rather than the empty string.
+	if reverseSig != "" {
+		teamSectionJSON.SetKey("reverse_sig", jsonw.NewString(reverseSig))
+	} else {
+		teamSectionJSON.SetKey("reverse_sig", jsonw.NewNil())
+	}
+
 	body := ret.AtKey("body")
-	body.SetKey("team", teamSection)
+	body.SetKey("team", teamSectionJSON)
 	return ret, nil
 }
 

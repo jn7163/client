@@ -5,13 +5,15 @@ package engine
 
 import (
 	"crypto/hmac"
-	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/keybase/client/go/libkb"
 	"github.com/keybase/client/go/protocol/keybase1"
-	jsonw "github.com/keybase/go-jsonw"
 
 	"golang.org/x/crypto/nacl/box"
 )
@@ -57,42 +59,58 @@ func (e *NewTeamEngine) Run(ctx *Context) (err error) {
 		return err
 	}
 
-	ska := libkb.SecretKeyArg{
-		Me:      me,
-		KeyType: libkb.DeviceSigningKeyType,
-	}
-	sigKey, err := e.G().Keyrings.GetSecretKeyWithPrompt(ctx.SecretKeyPromptArg(ska, "to create a new team"))
-	if err != nil {
-		return err
-	}
-	if err = sigKey.CheckSecretKey(); err != nil {
-		return err
-	}
-
-	teamSection, err := makeRootTeamSection(e.name, me)
-	if err != nil {
-		return err
-	}
-	teamSectionJSON, err := jsonw.WrapperFromObject(teamSection)
+	deviceSigningKey, deviceEncryptionKey, err := e.getDeviceKeys(ctx, me)
 	if err != nil {
 		return err
 	}
 
-	innerJSON, err := me.TeamRootSig(sigKey, teamSectionJSON)
+	perTeamSecret, perTeamSigningKey, perTeamEncryptionKey, err := generatePerTeamKeys()
 	if err != nil {
 		return err
 	}
 
-	innerJSONBytes, err := innerJSON.Marshal()
+	ownerLatest := me.GetComputedKeyFamily().GetLatestSharedDHKey()
+	if ownerLatest == nil {
+		return errors.New("can't create a new team without having provisioned a per-user key")
+	}
+	secretboxRecipients := map[string]keybase1.SharedDHKey{
+		me.GetName(): *ownerLatest,
+	}
+	// These boxes will get posted along with the sig below.
+	secretboxes, err := boxTeamSharedSecret(perTeamSecret, deviceEncryptionKey, secretboxRecipients)
+
+	teamSection, err := makeRootTeamSectionNoReverse(e.name, me, perTeamSigningKey.GetKID(), perTeamEncryptionKey.GetKID())
 	if err != nil {
 		return err
 	}
 
+	// At this point the team section has every field filled out except the
+	// reverse sig. Now we'll wrap it into a full sig, marshal it to JSON, and
+	// sign it, *twice*. The first time with the per-team signing key, to
+	// produce the reverse sig, and the second time with the device signing
+	// key, after the reverse sig has been written in.
+
+	sigBodyForReverse, err := me.TeamRootSig(deviceSigningKey, teamSection, "" /* reverseSig */)
+	if err != nil {
+		return err
+	}
+	// Note that this (sigchain-v1-style) reverse sig is made with the derived *per-team* signing key.
+	reverseSig, _, _, err := libkb.SignJSON(sigBodyForReverse, perTeamSigningKey)
+
+	// Update the team section to include the reverse sig, format it again, and make a sigchain-v2-style sig out of it.
+	sigBodyAfterReverse, err := me.TeamRootSig(deviceSigningKey, teamSection, reverseSig)
+	if err != nil {
+		return err
+	}
+	sigJSONAfterReverse, err := json.Marshal(sigBodyAfterReverse)
+	if err != nil {
+		return err
+	}
 	v2Sig, err := makeSigchainV2OuterSig(
-		sigKey,
+		deviceSigningKey,
 		libkb.LinkTypeTeamRoot,
 		1, /* seqno */
-		innerJSONBytes,
+		sigJSONAfterReverse,
 		nil,   /* prevLinkID */
 		false, /* hasRevokes */
 	)
@@ -102,14 +120,15 @@ func (e *NewTeamEngine) Run(ctx *Context) (err error) {
 
 	sigMultiItem := libkb.SigMultiItem{
 		Sig:        v2Sig,
-		SigningKID: sigKey.GetKID().String(),
+		SigningKID: deviceSigningKey.GetKID().String(),
 		Type:       string(libkb.LinkTypeTeamRoot),
-		SigInner:   string(innerJSONBytes),
+		SigInner:   string(sigJSONAfterReverse),
 		TeamID:     libkb.RootTeamIDFromName(e.name),
 	}
 
 	payload := make(libkb.JSONPayload)
 	payload["sigs"] = []interface{}{sigMultiItem}
+	payload["per_team_key"] = secretboxes
 
 	_, err = e.G().API.PostJSON(libkb.APIArg{
 		Endpoint:    "sig/multi",
@@ -123,25 +142,108 @@ func (e *NewTeamEngine) Run(ctx *Context) (err error) {
 	return nil
 }
 
-type TeamSection struct {
-	Name    string `json:"name"`
-	ID      string `json:"id"`
-	Members struct {
-		Owner  []string `json:"owner"`
-		Admin  []string `json:"admin"`
-		Writer []string `json:"writer"`
-		Reader []string `json:"reader"`
-	} `json:"members"`
-	SharedKey struct {
-		E     string            `json:"E"`
-		Boxes map[string]string `json:"boxes"`
-		Gen   int               `json:"gen"`
-	} `json:"shared_key"`
+func (e *NewTeamEngine) getDeviceKeys(ctx *Context, me *libkb.User) (sigKey libkb.NaclSigningKeyPair, encKey libkb.NaclDHKeyPair, err error) {
+	sigSKA := libkb.SecretKeyArg{
+		Me:      me,
+		KeyType: libkb.DeviceSigningKeyType,
+	}
+	sigGenericKey, err := e.G().Keyrings.GetSecretKeyWithPrompt(ctx.SecretKeyPromptArg(sigSKA, "to create a new team"))
+	if err != nil {
+		return
+	}
+	if err = sigGenericKey.CheckSecretKey(); err != nil {
+		return
+	}
+	sigKey, ok := sigGenericKey.(libkb.NaclSigningKeyPair)
+	if !ok {
+		err = fmt.Errorf("got an unexpected key type for device signing key: %T", sigGenericKey)
+		return
+	}
+
+	encSKA := libkb.SecretKeyArg{
+		Me:      me,
+		KeyType: libkb.DeviceSigningKeyType,
+	}
+	encGenericKey, err := e.G().Keyrings.GetSecretKeyWithPrompt(ctx.SecretKeyPromptArg(encSKA, "to create a new team"))
+	if err != nil {
+		return
+	}
+	if err = encGenericKey.CheckSecretKey(); err != nil {
+		return
+	}
+	encKey, ok = encGenericKey.(libkb.NaclDHKeyPair)
+	if !ok {
+		err = fmt.Errorf("got an unexpected key type for device signing key: %T", encGenericKey)
+		return
+	}
+
+	return
 }
 
-func makeRootTeamSection(teamName string, owner *libkb.User) (TeamSection, error) {
+func generatePerTeamKeys() (sharedSecret []byte, signingKey libkb.NaclSigningKeyPair, encryptionKey libkb.NaclDHKeyPair, err error) {
+	// This is the magical secret key, from which we derive a DH keypair and a
+	// signing keypair.
+	sharedSecret, err = libkb.RandBytes(32)
+	if err != nil {
+		return
+	}
+	encryptionKey, err = libkb.MakeNaclDHKeyPairFromSecretBytes(derivedSecret(sharedSecret, libkb.TeamDHDerivationString))
+	if err != nil {
+		return
+	}
+	signingKey, err = libkb.MakeNaclSigningKeyPairFromSecretBytes(derivedSecret(sharedSecret, libkb.TeamEdDSADerivationString))
+	if err != nil {
+		return
+	}
+	return
+}
+
+type PerTeamSharedSecretBoxes struct {
+	Generation    int               `json:"generation"`
+	EncryptingKid string            `json:"encrypting_kid"`
+	Nonce         string            `json:"nonce"`
+	Prev          string            `json:"prev"`
+	Boxes         map[string]string `json:"boxes"`
+}
+
+func boxTeamSharedSecret(secret []byte, senderKey libkb.NaclDHKeyPair, recipients map[string]keybase1.SharedDHKey) (*PerTeamSharedSecretBoxes, error) {
+	noncePrefix, err := libkb.RandBytes(20)
+	if err != nil {
+		return nil, err
+	}
+	// The counter starts at 1, because 0 will be the prev secretbox, which is
+	// omitted for the team root link, because this is the first shared key.
+	var counter uint32 = 1
+	boxes := make(map[string]string)
+	for username, recipientPerUserSharedKey := range recipients {
+		recipientPerUserGenericKeypair, err := libkb.ImportKeypairFromKID(recipientPerUserSharedKey.Kid)
+		if err != nil {
+			return nil, err
+		}
+		recipientPerUserNaclKeypair, ok := recipientPerUserGenericKeypair.(libkb.NaclDHKeyPair)
+		if !ok {
+			return nil, fmt.Errorf("got an unexpected key type for recipient KID in sharedTeamKeyBox: %T", recipientPerUserGenericKeypair)
+		}
+		var nonce [24]byte
+		copy(nonce[:20], noncePrefix)
+		binary.BigEndian.PutUint32(nonce[20:24], counter)
+		ctext := box.Seal(nil, secret, &nonce, ((*[32]byte)(&recipientPerUserNaclKeypair.Public)), ((*[32]byte)(senderKey.Private)))
+		base64Secretbox := base64.StdEncoding.EncodeToString(ctext)
+		boxes[username] = base64Secretbox
+	}
+
+	return &PerTeamSharedSecretBoxes{
+		Generation:    1,
+		EncryptingKid: string(senderKey.GetKID()),
+		Nonce:         base64.StdEncoding.EncodeToString(noncePrefix),
+		Prev:          "", // no prev for the first team link
+		Boxes:         boxes,
+	}, nil
+}
+
+func makeRootTeamSectionNoReverse(teamName string, owner *libkb.User, perTeamSigningKID keybase1.KID, perTeamEncryptionKID keybase1.KID) (libkb.TeamSection, error) {
 	teamID := libkb.RootTeamIDFromName(teamName)
-	teamSection := TeamSection{
+	teamSection := libkb.TeamSection{
 		Name: teamName,
 		ID:   teamID,
 	}
@@ -156,80 +258,23 @@ func makeRootTeamSection(teamName string, owner *libkb.User) (TeamSection, error
 	teamSection.Members.Admin = []string{}
 	teamSection.Members.Writer = []string{}
 	teamSection.Members.Reader = []string{}
-	teamSection.SharedKey.Boxes = map[string]string{}
+	teamSection.PerTeamKey.Generation = 1
+	teamSection.PerTeamKey.SigningKID = string(perTeamSigningKID)
+	teamSection.PerTeamKey.EncryptionKID = string(perTeamEncryptionKID)
 
-	ephemeralPair, err := libkb.GenerateNaclDHKeyPair()
-	if err != nil {
-		return teamSection, err
-	}
-	teamSection.SharedKey.E = ephemeralPair.Public.GetKID().String()
-	teamSection.SharedKey.Gen = 1
-
-	// This is the shared secret key. Do not store it except encrypted in the
-	// boxes that follow!
-	sharedSecretKey, err := libkb.RandBytes(32)
-	if err != nil {
-		return teamSection, err
-	}
-
-	// Note that the key boxes use usernames directly, without the %Seqno
-	// annotation from the roles section.
-	ownerSharedDHKey := owner.GetComputedKeyFamily().GetLatestSharedDHKey()
-	if ownerSharedDHKey == nil {
-		return teamSection, fmt.Errorf("can't create new team without a shared DH key")
-	}
-	ownerSharedKeyBox, err := makeSharedTeamKeyBox(ephemeralPair, *ownerSharedDHKey, owner.GetName(), sharedSecretKey, teamID)
-	if err != nil {
-		return teamSection, err
-	}
-	teamSection.SharedKey.Boxes[owner.GetName()] = ownerSharedKeyBox
+	// At this point the team section has every field filled out except the
+	// reverse sig. Now we'll wrap it into a full sig, marshal it to JSON, and
+	// sign it, *twice*. The first time with the per-team signing key, to
+	// produce the reverse sig, and the second time with the device signing
+	// key, after the reverse sig has been written in.
 
 	return teamSection, nil
 }
 
-type sharedTeamKeyBox struct {
-	_struct bool `codec:",toarray"`
-	Version int
-	Seqno   int
-	Box     []byte
-}
-
-func makeSharedTeamKeyBox(ephemeralPair libkb.NaclDHKeyPair, recipientKey keybase1.SharedDHKey, recipientName string, sharedSecretKey []byte, teamID string) (string, error) {
-	nonceHmacKey := fmt.Sprintf("TEAM %s SHARED KEY BOX", teamID)
-	nonceDigest := hmac.New(sha256.New, []byte(nonceHmacKey))
-	nonceDigest.Write([]byte(recipientName))
-	nonce := libkb.MakeByte24(nonceDigest.Sum(nil)[0:24])
-
-	recipientKeypair, err := libkb.ImportKeypairFromKID(recipientKey.Kid)
-	if err != nil {
-		return "", err
-	}
-	recipientNaclKeypair, ok := recipientKeypair.(libkb.NaclDHKeyPair)
-	if !ok {
-		return "", fmt.Errorf("got an unexpected key type for recipient KID in sharedTeamKeyBox: %T", recipientKeypair)
-	}
-
-	ciphertext := box.Seal(
-		nil,
-		sharedSecretKey,
-		&nonce,
-		(*[32]byte)(&recipientNaclKeypair.Public),
-		(*[32]byte)(ephemeralPair.Private))
-
-	boxStruct := sharedTeamKeyBox{
-		Version: libkb.SharedTeamKeyBoxVersion1,
-		Seqno:   recipientKey.Seqno,
-		Box:     ciphertext,
-	}
-
-	msgpackBytes, err := libkb.MsgpackEncode(boxStruct)
-	if err != nil {
-		return "", err
-	}
-
-	base64Str := base64.StdEncoding.EncodeToString(msgpackBytes)
-
-	return base64Str, nil
+func derivedSecret(secret []byte, context string) []byte {
+	digest := hmac.New(sha512.New, secret)
+	digest.Write([]byte(context))
+	return digest.Sum(nil)[:32]
 }
 
 func makeSigchainV2OuterSig(

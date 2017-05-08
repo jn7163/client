@@ -10,7 +10,6 @@ import (
 )
 
 func TestPostNewTeam(t *testing.T) {
-	t.Skip()
 	tc := SetupEngineTest(t, "crypto")
 	defer tc.Cleanup()
 
@@ -35,7 +34,6 @@ func TestPostNewTeam(t *testing.T) {
 }
 
 func TestPostNewTeamAfterAccountReset(t *testing.T) {
-	t.Skip()
 	tc := SetupEngineTest(t, "crypto")
 	defer tc.Cleanup()
 
